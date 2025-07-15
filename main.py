@@ -31,16 +31,19 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
+        logger.info("WebSocket connection accepted")
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+            logger.info("WebSocket connection removed")
 
     async def broadcast(self, message: dict):
         for connection in self.active_connections:
             try:
                 await connection.send_text(json.dumps(message))
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Failed to broadcast to a connection: {e}")
 
 manager = ConnectionManager()
 
@@ -55,6 +58,7 @@ class GameState:
         self.has_gold = False
         self.visited_cells = {(0, 0)}
         self.game_status = "playing"  # "playing", "won", "lost"
+        self.paused = True  # Default to paused
         
     def reset(self, environment_data=None):
         self.environment = WumpusEnvironment(grid_size=10)  # Default size 10
@@ -71,17 +75,23 @@ class GameState:
         self.has_gold = False
         self.visited_cells = {(0, 0)}
         self.game_status = "playing"
+        self.paused = True  # Reset to paused
         self.knowledge_base.add_fact("Safe(0,0)")
         self.knowledge_base.add_fact("Visited(0,0)")
         self.knowledge_base.add_wumpus_rules()
 
 game_state = GameState()
+ai_task = None  # Track the run_ai_agent task
 
 class EnvironmentRequest(BaseModel):
     grid: List[List[str]]
 
 @app.post("/api/reset")
 async def reset_game(env_request: Optional[EnvironmentRequest] = None):
+    global ai_task
+    if ai_task is not None:
+        ai_task.cancel()
+        ai_task = None
     env_data = env_request.grid if env_request else None
     game_state.reset(env_data)
     
@@ -95,11 +105,14 @@ async def reset_game(env_request: Optional[EnvironmentRequest] = None):
 
 @app.post("/api/start")
 async def start_game():
+    global ai_task
     if not game_state.environment:
         game_state.reset()
     
+    game_state.paused = False
     logger.info("AI agent started")
-    asyncio.create_task(run_ai_agent())
+    if ai_task is None or ai_task.done():
+        ai_task = asyncio.create_task(run_ai_agent())
     
     return {"status": "AI agent started"}
 
@@ -110,6 +123,9 @@ async def step_game():
     
     if game_state.game_over:
         return {"status": "Game is over"}
+    
+    if game_state.paused:
+        return {"status": "Game is paused"}
     
     await execute_agent_step()
     return {"status": "Step executed"}
@@ -129,12 +145,31 @@ async def websocket_endpoint(websocket: WebSocket):
         
         while True:
             data = await websocket.receive_text()
-            message = json.loads(data)
-            
-            if message.get("type") == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
+            try:
+                message = json.loads(data)
+                if message.get("type") == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+                elif message.get("type") == "pause":
+                    if "paused" in message:
+                        game_state.paused = bool(message["paused"])
+                    else:
+                        game_state.paused = not game_state.paused
+                    status = "paused" if game_state.paused else "resumed"
+                    logger.info(f"Game {status}")
+                    await manager.broadcast({
+                        "type": "game_state",
+                        "data": get_game_state_data()
+                    })
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON received: {e}")
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}")
                 
     except WebSocketDisconnect:
+        manager.disconnect(websocket)
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket endpoint error: {e}")
         manager.disconnect(websocket)
 
 @app.post("/api/upload_env")
@@ -170,8 +205,9 @@ def get_game_state_data():
             "last_inference": "",
             "percepts": [],
             "game_status": "playing",
-            "has_arrow": True,  # NEW
-            "arrow_used": False  # NEW
+            "has_arrow": True,
+            "arrow_used": False,
+            "paused": True
         }
     
     logger.debug(f"Game state data requested - Agent at {game_state.agent_pos}")
@@ -190,13 +226,16 @@ def get_game_state_data():
         "last_inference": game_state.inference_engine.get_last_inference(),
         "percepts": game_state.environment.get_percepts(game_state.agent_pos),
         "game_status": game_state.game_status,
-        "has_arrow": game_state.knowledge_base.has_arrow,  # NEW
-        "arrow_used": game_state.knowledge_base.arrow_used  # NEW
+        "has_arrow": game_state.knowledge_base.has_arrow,
+        "arrow_used": game_state.knowledge_base.arrow_used,
+        "paused": game_state.paused
     }
+
 async def run_ai_agent():
     while not game_state.game_over and game_state.agent_alive:
-        logger.info(f"Running AI agent step at position {game_state.agent_pos}")
-        await execute_agent_step()
+        if not game_state.paused:
+            logger.info(f"Running AI agent step at position {game_state.agent_pos}")
+            await execute_agent_step()
         await asyncio.sleep(1.0)
 
 async def execute_agent_step():
@@ -225,7 +264,7 @@ async def execute_agent_step():
             game_state.game_status = "won"
             logger.info("Gold grabbed, game won")
     
-    # NEW: Handle arrow shooting
+    # Handle arrow shooting
     if action.startswith("SHOOT_"):
         direction = action.split("_")[1]
         heard_scream = game_state.environment.shoot_arrow(game_state.agent_pos, direction)
